@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 lazy_static!{
-    static ref symbol_map: HashMap<char, &'static str> = hashmap! {
+    static ref SYMBOL_MAP: HashMap<char, &'static str> = hashmap! {
             '>' => "    inc     r8\n",
             '<' => "    dec     r8\n",
             '+' => "    inc     byte [r8]\n",
@@ -29,12 +29,12 @@ impl Compilation {
     // FIXME: This and output_calls() can both be done in 1 iteration 
     // and should most likely be cached within the struct
     fn cells(&self) -> usize {
-        self.input.matches(">").count() + 1
+        self.input.matches('>').count() + 1
     }
 
     // FIXME: see cells()
     fn output_calls(&self) -> usize {
-        self.input.matches(".").count()
+        self.input.matches('.').count()
     }
 
     pub fn generate_assembly(&self) -> String {
@@ -43,8 +43,8 @@ impl Compilation {
         output.push_str("global    _main\n");
         output.push_str("extern    _printf\n");
         output.push_str("default    rel\n");
-        output.push_str("\n");
-        output.push_str("\n");
+        output.push('\n');
+        output.push('\n');
         output.push_str("section   .text\n");
         output.push_str("_main:  \n");
         output.push_str("    sub    rsp, 8 ; Align the stack pointer \n");
@@ -54,7 +54,7 @@ impl Compilation {
         let mut loop_counter = 0;
         let mut loops_open = Vec::new();
         for c in self.input.chars() {
-            if let Some(instruction) = symbol_map.get(&c) {
+            if let Some(instruction) = SYMBOL_MAP.get(&c) {
                 let i = if c == '[' {
                     loop_counter += 1;
                     loops_open.push(loop_counter);
@@ -81,9 +81,9 @@ impl Compilation {
 
         // bss
         output.push_str("section   .bss\n");
-        output.push_str("\n");
+        output.push('\n');
         output.push_str(r#"format: db "%c""#);
-        output.push_str("\n");
+        output.push('\n');
         output.push_str(&format!("output: times {} db 0\n", self.output_calls()));
         output.push_str(&format!("cell:   times {} db 0\n", self.cells()));
 

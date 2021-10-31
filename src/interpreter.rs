@@ -8,8 +8,7 @@ struct State {
 
 impl State {
     fn new() -> Self {
-        let mut data = Vec::with_capacity(30_000);
-        data.resize(30_000, 0);
+        let data = vec![0; 30_000];
 
         State {
             data,
@@ -48,18 +47,18 @@ impl State {
 }
 
 #[derive(Default)]
-pub struct Interpretter {
+pub struct Interpreter {
     input: String,
     index: usize,
     loop_entry: Vec<usize>,
     state: State
 }
 
-impl Interpretter {
-    pub fn new() -> Interpretter {
-        Interpretter {
+impl Interpreter {
+    pub fn new() -> Interpreter {
+        Interpreter {
             state: State::new(),
-            ..Interpretter::default()
+            ..Interpreter::default()
         }
     }
     pub fn execute(&mut self) {
