@@ -1,6 +1,7 @@
 #![feature(asm)]
 #![feature(fn_traits)]
 #![feature(unboxed_closures)]
+#![feature(ptr_internals)]
 
 #[macro_use]
 extern crate maplit;
@@ -61,9 +62,10 @@ fn main() -> Result<()> {
         bf.execute()
     } else if config.jit {
         let mut context = jit::Context::new(64);
-        let bf = jit::jit_compile(&parser::parse(&input_string).unwrap());
-        let dump = jit::jit_compile_to_bytes(&parser::parse(&input_string).unwrap());
-        std::fs::write("jit_bytes_dump.bin", dump).unwrap();
+        let ops = parser::parse(&input_string).unwrap();
+        let bf = jit::jit_compile(&ops);
+        //let dump = jit::jit_compile_to_bytes(&parser::parse(&input_string).unwrap());
+        //std::fs::write("jit_bytes_dump.bin", dump).unwrap();
         println!("Program JIT compiled, executing now");
         bf(&mut context);
         println!("Output: {}", context.to_string());

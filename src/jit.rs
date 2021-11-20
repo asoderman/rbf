@@ -1,10 +1,10 @@
-#![allow(dead_code)]
-use libc::{ PROT_EXEC, PROT_READ, PROT_WRITE, c_void, mprotect, munmap, posix_memalign};
+use libc::{PROT_EXEC, PROT_READ, PROT_WRITE, c_void, mprotect, munmap, posix_memalign};
 use std::ops::{Drop, Fn};
+use std::ptr::Unique;
 
 use crate::parser::Ops;
 
-const PAGESIZE: usize = 4096;
+const PAGESIZE: usize = 4096; // bytes
 
 #[repr(C)]
 #[derive(Debug)]
@@ -25,13 +25,13 @@ impl Context {
 }
 
 pub struct JITFn {
-    addr: *mut u8,
-    size_pages: usize,
-    size_bytes: isize
+    addr: Unique<u8>,
+    len: usize
 }
 
-impl Fn<(*mut Context,)> for JITFn {
-    extern "rust-call" fn call(&self, args: (*mut Context,)) {
+impl Fn<(&mut Context,)> for JITFn {
+    extern "rust-call" fn call(&self, args: (&mut Context,)) {
+        // Safety: We know fn_ptr is a C function since we assembled it :)
         unsafe {
             let fn_ptr: extern "C" fn(*mut Context);
 
@@ -42,23 +42,25 @@ impl Fn<(*mut Context,)> for JITFn {
     }
 }
 
-impl FnOnce<(*mut Context,)> for JITFn {
+impl FnOnce<(&mut Context,)> for JITFn {
     type Output = ();
-    extern "rust-call" fn call_once(self, args: (*mut Context,)) {
+    extern "rust-call" fn call_once(self, args: (&mut Context,)) {
         self.call(args)
     }
 }
 
-impl FnMut<(*mut Context,)> for JITFn {
-    extern "rust-call" fn call_mut(&mut self, args: (*mut Context,)) {
+impl FnMut<(&mut Context,)> for JITFn {
+    extern "rust-call" fn call_mut(&mut self, args: (&mut Context,)) {
         self.call(args)
     }
 }
 
 impl Drop for JITFn {
     fn drop(&mut self) {
+        // Safety: The buffer should still be alive once the JITFn is dropped.
         unsafe {
-            assert_eq!(munmap(self.addr as *mut c_void, self.size_pages * PAGESIZE as usize), 0);
+            let ref_c_void = self.addr.as_ptr() as *mut c_void;
+            assert_eq!(munmap(ref_c_void, self.len), 0);
         }
     }
 }
@@ -74,8 +76,6 @@ const PUSH_RAX: [u8; 1] = [0x50];
 const MOV_RBP_RSP: [u8; 3] = [0x48, 0x89, 0xec];
 
 const MOV_RSP_RBP: [u8; 3] = [0x48, 0x89, 0xe5];
-
-const MOV_R8_RBP: [u8; 3] = [0x48, 0x89, 0xe8];
 
 const POP_RBP: u8 = 0x5D;
 
@@ -99,13 +99,11 @@ const DEC_VALUE: [u8; 4] = [0x42, 0xfe, 0x0c, 0x04];
 const ADD_RSP_32: [u8; 4] = [0x48, 0x83, 0xc4, 0x20];
 
 // SUB RSP Immediate
+#[allow(dead_code)] // Unused due to requirement of stack variables to be initialized to 0. Could be useful with a better initialization method
 const SUB_RSP_32: [u8; 4] = [0x48, 0x83, 0xec, 0x20];
 
 // MOV R9 RSI
 const MOV_R9_RSI: [u8; 3] = [0x4c, 0x8b, 0x0e];
-
-// MOV RAX, [RBP + R8]
-//const MOV_RAX_R8_RBP: [u8; 5] = [0x4a, 0x8b, 0x44, 0x05, 00];
 
 // MOV RAX (AL), byte [RSP + R8]
 const MOV_RAX_R8_RSP: [u8; 4] = [0x42, 0x8a, 0x04, 0x04];
@@ -152,6 +150,7 @@ trait JITAssembler {
     }
 
     fn epilogue(&mut self) {
+        // Deallocate stack variables
         self.add_rsp_32();
 
         // sysv abi
@@ -176,7 +175,7 @@ trait JITAssembler {
     }
 
     fn sub_rsp_32(&mut self) {
-        //self.push_bytes(&SUB_RSP_32);
+        // Push 8 bytes worth of 0s onto the stack
         self.push_bytes(&PUSH_RAX);
         self.push_bytes(&PUSH_RAX);
         self.push_bytes(&PUSH_RAX);
@@ -244,106 +243,97 @@ enum Protection {
     Executable
 }
 
-struct JITBuffer {
-    addr: *mut u8,
-    offset: isize,
-    size: usize,
+struct JITBuffer<'b> {
+    addr: &'b mut [u8],
+    offset: usize,
     prot: Protection,
 }
 
-impl JITBuffer {
-    pub unsafe fn new(size: usize) -> JITBuffer {
+impl<'b> JITBuffer<'b> {
+    pub fn new(pages: usize) -> JITBuffer<'b> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
 
         let rw = PROT_READ | PROT_WRITE;
- 
-        assert_eq!(posix_memalign(&mut ptr, PAGESIZE as usize, size * PAGESIZE as usize), 0);
 
-        mprotect(ptr, size * PAGESIZE as usize, rw);
+        let addr: &mut [u8];
+
+        // Safety: If the memory is unable to allocate properly we will panic
+        unsafe {
+            let len = pages * PAGESIZE;
+            assert_eq!(posix_memalign(&mut ptr, PAGESIZE as usize, len), 0);
+
+            assert_eq!(mprotect(ptr, len, rw), 0);
+            addr = std::slice::from_raw_parts_mut(ptr as *mut u8, len);
+        }
 
         JITBuffer {
-            addr: ptr as *mut u8,
+            addr,
             offset: 0,
-            size,
             prot: Protection::ReadWrite
         }
     }
 
     fn to_jit_fn(mut self) -> JITFn {
         self.map_executable();
+        // infallible 
         JITFn {
-            addr: self.addr,
-            size_pages: self.size,
-            size_bytes: self.offset
+            addr: Unique::new(self.addr.as_mut_ptr()).unwrap(),
+            len: self.addr.len()
         }
     }
 
-    pub fn bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        for i in 0..self.offset {
-            unsafe {
-                let b = *self.addr.offset(i);
-                bytes.push(b);
-            }
-        }
-        bytes
+    pub fn bytes(&self) -> &[u8] {
+        self.addr
     }
 
     fn impl_push_u8(&mut self, value: u8) {
-        unsafe {
-            *self.addr.offset(self.offset) = value;
-            self.offset += 1;
-        }
+        self.addr[self.offset] = value;
+        self.offset += 1;
     }
 
     fn map_executable(&mut self) {
         match self.prot {
             Protection::Executable => (),
             Protection::ReadWrite => {
+                // Safety: panics if mprotect fails
                 unsafe {
-                    assert_eq!(mprotect(self.addr as *mut c_void, self.size * PAGESIZE as usize, PROT_EXEC), 0);
+                    let len = self.addr.len();
+                    let ref_c_void: *mut c_void = { self.addr.as_ptr() } as *mut c_void;
+                    assert_eq!(mprotect(ref_c_void, len, PROT_EXEC), 0);
                 }
+                self.prot = Protection::Executable;
             }
         }
     }
 }
 
-impl JITAssembler for JITBuffer {
+impl<'b> JITAssembler for JITBuffer<'b> {
     fn push_u8(&mut self, value: u8) {
         self.impl_push_u8(value)
     }
 
     fn current_addr(&self) -> usize {
+        // Safety: offset must be within bounds of the slice therefore the address
+        // will be valid
         unsafe {
-            self.addr.offset(self.offset) as usize
+            assert!(self.offset < self.addr.len());
+            self.addr.as_ptr().offset(self.offset as isize) as usize
         }
     }
 }
 
-
 pub fn jit_compile(input: &Vec<Ops>) -> JITFn {
-    let mut buffer = unsafe { JITBuffer::new(1) };
+    let mut buffer = JITBuffer::new(1);
     buffer.assemble(input);
 
     buffer.to_jit_fn()
 }
 
 pub fn jit_compile_to_bytes(input: &Vec<Ops>) -> Vec<u8> {
-    let mut buffer = unsafe { JITBuffer::new(1) };
+    let mut buffer = JITBuffer::new(1);
     buffer.assemble(input);
-    buffer.bytes()
+    let mut b = Vec::new();
+    b.extend_from_slice(buffer.bytes());
+    b
 }
 
-#[inline]
-fn print_regs() {
-    let mut r8: u64;
-    let mut r9: u64;
-
-    unsafe {
-        asm!("mov {}, r8", out(reg) r8);
-        asm!("mov {}, r9", out(reg) r9);
-    }
-
-    println!("r8: {}", r8);
-    println!("r9: {}", r9);
-}
